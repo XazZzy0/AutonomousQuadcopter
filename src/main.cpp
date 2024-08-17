@@ -10,8 +10,6 @@
 using namespace BLA;
 
 #define MPU6050_Address 0X68
-#define pi 3.1415
-#define rad2deg pi/180
 #define TRIGGER_PIN 11
 #define ECHOPIN 12
 #define MAX_DISTANCE 200
@@ -124,10 +122,10 @@ void gyro_signals(void) {
   RatePitch = (float)GyroY/65.5;
   RateYaw = (float)GyroZ/65.5;
 
-  AngleRoll = atan(AccY/sqrt(pow(AccX,2)+pow(AccZ,2)))/(pi/180); // X-axis (Phi) --  Result in degrees
-  AnglePitch = -atan(AccX/sqrt(pow(AccY,2)+pow(AccZ,2)))/(pi/180); // Y-axis (Theta) -- 
+  AngleRoll = atan(AccY/sqrt(pow(AccX,2)+pow(AccZ,2)))/(PI/180); // X-axis (Phi) --  Result in degrees
+  AnglePitch = -atan(AccX/sqrt(pow(AccY,2)+pow(AccZ,2)))/(PI/180); // Y-axis (Theta) -- 
 
-  Inertial_AccZ = -sin(AnglePitch*rad2deg)*AccX + cos(AnglePitch*rad2deg)*sin(AngleRoll*rad2deg)*AccY + cos(AnglePitch*rad2deg)*cos(AngleRoll*rad2deg)*AccZ;
+  Inertial_AccZ = -sin(AnglePitch*RAD_TO_DEG)*AccX + cos(AnglePitch*RAD_TO_DEG)*sin(AngleRoll*RAD_TO_DEG)*AccY + cos(AnglePitch*RAD_TO_DEG)*cos(AngleRoll*RAD_TO_DEG)*AccZ;
   Inertial_AccZ = (Inertial_AccZ-1)*9.81;
   VelocityZ = VelocityZ + Inertial_AccZ*.004;
  }
