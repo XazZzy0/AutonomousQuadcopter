@@ -4,15 +4,17 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
-#include <Adafruit_MPU6050.h>
-#include <BasicLinearAlgebra.h>
-#include <NewPing.h>
+#include "Adafruit_MPU6050.h"
+#include "BasicLinearAlgebra.h"
+#include "NewPing.h"
 using namespace BLA;
 
 #define MPU6050_Address 0X68
-#define TRIGGER_PIN 11
-#define ECHOPIN 12
+#define TRIGGER_PIN 8
+#define ECHOPIN 9
 #define MAX_DISTANCE 200
+#define RED_LED 10
+#define GREEN_LED 12
 
 Adafruit_MPU6050 mpu;
 NewPing sonar(TRIGGER_PIN, ECHOPIN, MAX_DISTANCE);
@@ -32,6 +34,7 @@ float K_AnglePitch = 0, K_UncertaintyAnglePitch = 2*2;
 float K_1DOutput[] = {0,0};
 
 float temp = 0;
+float batterylife;
 
 // ----- Barometer Set up -----
 // https://cdn-shop.adafruit.com/datasheets/BST-BMP280-DS001-11.pdf
@@ -52,11 +55,6 @@ BLA::Matrix<1,1, float> L; BLA::Matrix<1,1, float> M;
 
 // ----- Environment Set up -----
 float ge = 9.81; // gravity
-
-// LED Setup
-float batteryvoltage = 7.4; //MAKE SURE TO UPDATE TO CORRECT NOMINAL VOLTAGE
-float ardvoltage = 5;
-float voltage;
 
 // ----- 1D Kalman Filter function -----
 // https://en.wikipedia.org/wiki/Kalman_filter
@@ -125,7 +123,8 @@ void gyro_signals(void) {
   AngleRoll = atan(AccY/sqrt(pow(AccX,2)+pow(AccZ,2)))/(PI/180); // X-axis (Phi) --  Result in degrees
   AnglePitch = -atan(AccX/sqrt(pow(AccY,2)+pow(AccZ,2)))/(PI/180); // Y-axis (Theta) -- 
 
-  Inertial_AccZ = -sin(AnglePitch*RAD_TO_DEG)*AccX + cos(AnglePitch*RAD_TO_DEG)*sin(AngleRoll*RAD_TO_DEG)*AccY + cos(AnglePitch*RAD_TO_DEG)*cos(AngleRoll*RAD_TO_DEG)*AccZ;
+  Inertial_AccZ = -sin(AnglePitch*RAD_TO_DEG)*AccX + cos(AnglePitch*RAD_TO_DEG)*sin(AngleRoll*RAD_TO_DEG)*AccY 
+                  + cos(AnglePitch*RAD_TO_DEG)*cos(AngleRoll*RAD_TO_DEG)*AccZ;
   Inertial_AccZ = (Inertial_AccZ-1)*9.81;
   VelocityZ = VelocityZ + Inertial_AccZ*.004;
  }
@@ -173,20 +172,34 @@ void barometer_signals(void){
 }
 
 // Verifies current battery life
-void bms_check(void){
-  voltage = (float)analogRead(A7)/1023*ardvoltage*2*.965;
+float bms_check(bool init){
+  float voltage, batteryremaining, batteryatstart;
+ // float current, currcons, precurrcons;
+  float batterydefault = 1200;
+  float R1 = 1850;
+  float R2 = 535;
+  float RVdrop = 464;
+  float vdropratio = (RVdrop/100)/14;
 
-  if (voltage<batteryvoltage*.98)
-  {
-      digitalWrite(2, HIGH);
-      digitalWrite(3, LOW);
+  voltage = (float)analogRead(A1)/1023*5*((R1+R2)/R2);  //VOLTAGE DIVIDER READING
+ // current = (float)analogRead(A6)/(1023/5)*vdropratio;
+
+  if (voltage>8.3){
+    batteryatstart=batterydefault;
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH); //keep green led on
+  }else if(voltage<7.5){
+    batteryatstart=30/100*batterydefault;
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW); // keep green led on
+  }else{
+    batteryatstart=(82*voltage-580)/100*batterydefault;
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH); // turn on green led
   }
-  else
-  {
-    digitalWrite(2, LOW);
-    digitalWrite(3, HIGH);
+    return voltage;
   }
-}
+
 
 void setup(void) {
  /*Makes contact with the serial interface*/
@@ -215,8 +228,7 @@ void setup(void) {
   Wire.write(0x88);
   Wire.endTransmission();
   Wire.requestFrom(0x76,24);
-  while(Wire.available())
-  {
+  while(Wire.available()){
     data[i] = Wire.read();
     i++;
   }
@@ -235,13 +247,13 @@ void setup(void) {
   delay(250);
 
   /*Battery LED Set-up*/
-  pinMode(2, OUTPUT); // Red LED
-  pinMode(3, OUTPUT); // Green LED
-  bms_check();
+  pinMode(RED_LED, OUTPUT); // Red LED pinout
+  pinMode(GREEN_LED, OUTPUT); // Green LED pinout
+  batterylife=bms_check(true);
  // checks current battery life
 
   /*IMU Calibration timer*/
-  if (true) // Skips calibration if false
+  if(true) // Skips calibration if false
   {
     for (RateCalibrationNumber=0; RateCalibrationNumber<2000; RateCalibrationNumber++)
     {
@@ -257,8 +269,9 @@ void setup(void) {
     RateCalibrationRoll /= 2000;
     RateCalibrationPitch /= 2000;
     RateCalibrationYaw /= 2000;
+  }
 
-    //Defining Kalman Matrix Values
+  //Defining Kalman Matrix Values
     F = {1, 0.004, 0, 1};
     G = {0.5*0.004*0.004, 0.004};
     H = {1, 0};
@@ -268,12 +281,11 @@ void setup(void) {
     P = {0, 0, 0, 0};
     S = {0, 0};
     LoopTimer = micros();
-  }
 } 
 
 void loop() 
 {
-  bms_check();
+  batterylife=bms_check(false);
   barometer_signals();
   Altitude -= AltitudeStartUp;
   gyro_signals();
@@ -291,11 +303,11 @@ void loop()
   k2d();
 
   Serial.print(">AngleRoll:");
-  Serial.println(AngleRoll);
+  Serial.println(K_AngleRoll);
   Serial.print(">Altitude:");
   Serial.println(K_Altitude);
-  Serial.print(">Voltage:");
-  Serial.println(voltage);
+  Serial.print(">Batterylife:");
+  Serial.println(batterylife);
   Serial.print(">K_VelocityZ:");
   Serial.println(K_VelocityZ);
   Serial.print(">Distance:");
