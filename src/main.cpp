@@ -1,6 +1,7 @@
-// Authors: Jacob Wood & Nico Wood
+// Authors: Jacob Wood
 // Based on ideas given from : Carbon_Aeronautics_Quadcopter_Manual.pdf 
 
+// LIBRARIES
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
@@ -9,14 +10,16 @@
 #include "NewPing.h"
 using namespace BLA;
 
-#define MPU6050_Address 0X68
-#define TRIGGER_PIN 8
-#define ECHOPIN 9
-#define MAX_DISTANCE 200
-#define RED_LED 10
-#define GREEN_LED 12
+// VARIABLES
+#define MPU6050_Address 0X68 // MPU WIRE ADRESS
+#define TRIGGER_PIN 8        // OUTPUT OF THE TRIGGER PIN (SONAR)
+#define ECHOPIN 9            // OUTPUT OF THE ECHO PIN (SONAR)
+#define MAX_DISTANCE 200     // TOP DISTANCE BOUND (SONAR)
+#define RED_LED 11           // OUTPUT PIN ON THE LED
+#define GREEN_LED 12         // OUTPUT PIN ON THE GREEN_LED
 
-Adafruit_MPU6050 mpu;
+// OBJECTS
+Adafruit_MPU6050 mpu;  
 NewPing sonar(TRIGGER_PIN, ECHOPIN, MAX_DISTANCE);
 
 // ----- IMU Set up -----
@@ -85,8 +88,10 @@ void k2d(void){
   P=(I-K*H)*P;
 }
 
+// ======================= GYRO SIGNALING =======================
 //Register map: https://invensense.tdk.com/wp-content/uploads/2015/02/MPU-6000-Register-Map1.pdf & https://www.youtube.com/watch?v=7VW_XVbtu9k 
 void gyro_signals(void) {
+  // SPECIFYING MPU SENSOR OUTPUT
   Wire.beginTransmission(MPU6050_Address);
   Wire.write(0x1A);  // Low-pass filter activation
   Wire.write(0x05);  // Cut-off frequency of 10 hz -> DLPF setting of 5 = 00000101
@@ -102,30 +107,35 @@ void gyro_signals(void) {
     int16_t AccXLSB = Wire.read() << 8 | Wire.read();
     int16_t AccYLSB = Wire.read() << 8 | Wire.read();
     int16_t AccZLSB = Wire.read() << 8 | Wire.read();
+
+  // ACCESSING GYRO DATA
   Wire.beginTransmission(MPU6050_Address);
-  Wire.write(0x1B); // access registers which store gyro measurements
+  Wire.write(0x1B); // access registers which store accelerometer measurements
   Wire.write(0x8);
-  Wire.endTransmission(); 
-  AccX = (float)AccXLSB/4096 - 0.03;  //converts the LSB reading to g's (with calibration)
-  AccY = (float)AccYLSB/4096 + 0.00;
+  Wire.endTransmission();
+  //converts the LSB reading to g's (with rough calibration added)
+  AccY = (float)AccYLSB/4096 + 0.00; // [value +/- calibration] 
+  AccX = (float)AccXLSB/4096 - 0.03;  
   AccZ = (float)AccZLSB/4096 + 0.16;
-  Wire.beginTransmission(MPU6050_Address);
+
+  Wire.beginTransmission(MPU6050_Address); // access registers which store gyro measurements
   Wire.write(0x43);
   Wire.endTransmission();
   Wire.requestFrom(MPU6050_Address,6); 
-    int16_t GyroX = Wire.read() << 8 | Wire.read();
+    int16_t GyroX = Wire.read() << 8 | Wire.read(); //converts the LSB reading to g's (with calibration)
     int16_t GyroY = Wire.read() << 8 | Wire.read();
     int16_t GyroZ = Wire.read() << 8 | Wire.read();
-  RateRoll = (float)GyroX/65.5;
+  RateRoll = (float)GyroX/65.5; // calculates the attitude of the drone
   RatePitch = (float)GyroY/65.5;
   RateYaw = (float)GyroZ/65.5;
 
   AngleRoll = atan(AccY/sqrt(pow(AccX,2)+pow(AccZ,2)))/(PI/180); // X-axis (Phi) --  Result in degrees
   AnglePitch = -atan(AccX/sqrt(pow(AccY,2)+pow(AccZ,2)))/(PI/180); // Y-axis (Theta) -- 
 
+  // Calculates the Z component of the accelerometer
   Inertial_AccZ = -sin(AnglePitch*RAD_TO_DEG)*AccX + cos(AnglePitch*RAD_TO_DEG)*sin(AngleRoll*RAD_TO_DEG)*AccY 
                   + cos(AnglePitch*RAD_TO_DEG)*cos(AngleRoll*RAD_TO_DEG)*AccZ;
-  Inertial_AccZ = (Inertial_AccZ-1)*9.81;
+  Inertial_AccZ = (Inertial_AccZ-1)*9.81*100; // conversion to m/s
   VelocityZ = VelocityZ + Inertial_AccZ*.004;
  }
 
@@ -168,7 +178,7 @@ void barometer_signals(void){
   double pressure=(double)p/100; 
 
   Pressure = pressure/10; //converts into kilo-pascal
-  Altitude = 44330*(1-pow(pressure/1013.25, 1/5.255)) * 100; // currently in meters
+  Altitude = 44330*(1-pow(pressure/1013.25, 1/5.255)) * 100; // currently in centimeters
 }
 
 // Verifies current battery life
@@ -285,14 +295,20 @@ void setup(void) {
 
 void loop() 
 {
-  batterylife=bms_check(false);
-  barometer_signals();
-  Altitude -= AltitudeStartUp;
+  //gyro
   gyro_signals();
   RateRoll -= RateCalibrationRoll;
   RatePitch -= RateCalibrationPitch;
   RateYaw -= RateCalibrationYaw;
 
+  //battery
+  batterylife=bms_check(false);
+
+  //barometer
+  barometer_signals();
+  Altitude -= AltitudeStartUp;
+
+  //ultrasonic
   int distance = sonar.ping_cm(); // sonar reading in cm
 
   // Applied Kalman Filters
