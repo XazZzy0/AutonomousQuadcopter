@@ -1,334 +1,308 @@
-// Authors: Jacob Wood
-// Based on ideas given from : Carbon_Aeronautics_Quadcopter_Manual.pdf 
+///// Author(s): Jacob Wood
 
-// LIBRARIES
-#include <Arduino.h>
-#include <Wire.h>
-#include <math.h>
-#include "Adafruit_MPU6050.h"
-#include "BasicLinearAlgebra.h"
-#include "NewPing.h"
-using namespace BLA;
+/*
+ This code is used for a completely open-source (hackable) drone, the current concept is based on ideas given from : Carbon_Aeronautics_Quadcopter_Manual.pdf, but 
+ modified quite a bit. The long term goals of this project are to make this drone completely autonomous and have the ability to communicate to a drone swarm.
+ 
+ Currently, this drone operates off of an ELEGOO NANO, but will scope to an ESP32 in the future - giving me the availability for data communication 
+ through webservers.
+*/
 
-// VARIABLES
-#define MPU6050_Address 0X68 // MPU WIRE ADRESS
-#define TRIGGER_PIN 8        // OUTPUT OF THE TRIGGER PIN (SONAR)
-#define ECHOPIN 9            // OUTPUT OF THE ECHO PIN (SONAR)
-#define MAX_DISTANCE 200     // TOP DISTANCE BOUND (SONAR)
-#define RED_LED 11           // OUTPUT PIN ON THE LED
-#define GREEN_LED 12         // OUTPUT PIN ON THE GREEN_LED
+// ===========================================================================================================================================================
+// ======================================================================= PRE-INIT ==========================================================================
+// ===========================================================================================================================================================
 
-// OBJECTS
-Adafruit_MPU6050 mpu;  
-NewPing sonar(TRIGGER_PIN, ECHOPIN, MAX_DISTANCE);
+// --- LIBRARIES ---
+#include <Wire.h> // i2c communication (A4 = SDA, A5 = SCL)
+#include <math.h> // math
+#include <VL53L0X.h> // distance sensor
+#include <Adafruit_MPU6050.h> // imu
+#include <Adafruit_BMP280.h> // atmospheric pressure sensor
+#include <PPMReader.h> // radio reciever and control
+#include <BasicLinearAlgebra.h> // for linear algebra control
+  using namespace BLA;
 
-// ----- IMU Set up -----
-float AccX, AccY, AccZ;
-float RateRoll, RatePitch, RateYaw;
-float AngleRoll, AnglePitch;
-float Inertial_AccZ, VelocityZ;
+// --- Objects/PINOUT ---
+#define RED_LED 11           // OUTPUT PIN ON THE RED LED -> VOLTAGE LOW
+#define GREEN_LED 12         // OUTPUT PIN ON THE GREEN LED -> VOLTAGE NOMINAL
+uint8_t V_DIV = A7;          // Voltage divider location
+Adafruit_MPU6050 mpu;        // IMU unit
+Adafruit_BMP280 bmp;         // BMP280 Sensor
+VL53L0X tofsensor;           // Distance Sensor (time of flight)
 
-float RateCalibrationRoll, RateCalibrationPitch, RateCalibrationYaw;
-int RateCalibrationNumber;
-uint32_t LoopTimer;
+// --- Global Variables ---
+// Constants
+float mm2in = 0.03937008;
+float update_hz = 250;
+float dt = 1/update_hz*1E6; // update time of the drone in micro-seconds (250 hz)
 
-float K_AngleRoll = 0, K_UncertaintyAngleRoll = 2*2;
-float K_AnglePitch = 0, K_UncertaintyAnglePitch = 2*2;
-float K_1DOutput[] = {0,0};
+// FOR IMU
+float tempimu_f; // temperature
+float accX, accY, accZ; // actual measurement
+float rateroll, ratepitch, rateyaw; // actual measurement
+float anglepitch, angleroll, angleyaw; // direct calculation
+float k_roll, k_pitch, k_alt; // filtered measurement [measurement, uncertainty]
+float RateCalibrationRoll, RateCalibrationPitch, RateCalibrationYaw; // calibration constants
+float prev_dvdt, velocity_z; // The prior velocity change value (for estimating when climbing)
 
-float temp = 0;
-float batterylife;
+// FOR TOF SENSOR AND HEIGHT CALCULATIONS
+float alt_tof;
 
-// ----- Barometer Set up -----
-// https://cdn-shop.adafruit.com/datasheets/BST-BMP280-DS001-11.pdf
-uint16_t dig_T1, dig_P1;
-int16_t dig_T2, dig_T3, dig_P2, dig_P3, dig_P4, dig_P5;
-int16_t dig_P6, dig_P7 ,dig_P8, dig_P9;
+// FOR BAROMETER
+float altitude, pressure_baro, tempbaro_f;
+float alt_Cal, alt_pressureCal, alt_temperatureCal; // calibration constants
 
-float Altitude, AltitudeStartUp, Pressure;
+// FOR BATTERY MONITOR
+float volt_battery;
 
-//----- Altitude Filtering Set up -----
-float K_Altitude, K_VelocityZ;
-BLA::Matrix<2,2, float> F; BLA::Matrix<2,1, float> G;
-BLA::Matrix<2,2, float> P; BLA::Matrix<2,2, float> Q;
-BLA::Matrix<2,1, float> S; BLA::Matrix<1,2, float> H;
-BLA::Matrix<2,2, float> I; BLA::Matrix<1,1, float> Acc;
-BLA::Matrix<2,1, float> K; BLA::Matrix<1,1, float> R;
-BLA::Matrix<1,1, float> L; BLA::Matrix<1,1, float> M;
+// FOR RADIO RECIEVER
+byte interruptPin = 3;
+byte channelAmount = 6;
+PPMReader ppm(interruptPin, channelAmount);
+int arrayindex = 0;
+unsigned int Controller_CH[5]; // channels 0-6
 
-// ----- Environment Set up -----
-float ge = 9.81; // gravity
+// ===========================================================================================================================================================
+// ======================================================================= FUNCTIONS =========================================================================
+// ===========================================================================================================================================================
 
-// ----- 1D Kalman Filter function -----
-// https://en.wikipedia.org/wiki/Kalman_filter
-void k1d(float state, float uncertainty, float input, float measurement){
-  state = state + 0.004*input;
-  uncertainty = uncertainty + 0.004*0.004*4*4;
-  float k_gain = uncertainty/(1*uncertainty + 3*3);
+// --- Filter ---
+// FILTERS NOISY DATA FROM IMU for pitch and roll
+void FILTER(float U_roll, float U_pitch, float alt){
+  static float xkr, pkr, xkp, pkp, xka, pka; // Current Kalman values x = meas, p = uncertainty
+  static const float R1 = 9;
+  static const float H1 = 1;
+  static const float Q1 = 4, QA = 30; // expected variance (rough estimate)
+  static float Kr, Kp, Ka; //kalman gain
 
-  state = state + k_gain*(measurement-state);
-  uncertainty = (1-k_gain)*uncertainty;
+  xkr = xkr + (float)(1/update_hz)*U_roll;
+  xkp = xkp + (float)(1/update_hz)*U_pitch;
+  xka = xka + (float)(1/update_hz)*alt;
+  pkr = pkr + (float)(1/update_hz)*Q1;
+  pkp = pkp + (float)(1/update_hz)*Q1;
+  pka = pka + (float)(1/update_hz)*QA;
 
-  K_1DOutput[0] = state;
-  K_1DOutput[1] = uncertainty;
+  Kr = pkr*H1/(H1*pkr*H1+R1);
+  Kp = pkp*H1/(H1*pkp*H1+R1);
+  Ka = pka*H1/(H1*pka*H1+R1);
+  xkr = xkr + Kr*(U_roll-H1*xkr);
+  xkp = xkp + Kp*(U_pitch-H1*xkp);
+  xka = xka + Ka*(alt-H1*xka);
+  pkr = pkr-(Kr*H1*pkr);
+  pkp = pkp-(Kp*H1*pkp);
+  pka = pka-(Ka*H1*pka);
+  
+  k_roll = xkr;
+  k_pitch = xkp;
+  k_alt = xka;
 }
 
-// ----- 2D Kalman Filter function -----
-// https://www.youtube.com/watch?v=GZevJyabMdI&list=PLeuMA6tJBPKsAfRfFuGrEljpBow5hPVD4&index=22
-void k2d(void){
-  Acc = {Inertial_AccZ};
-  S=F*S+G*Acc;
-  P=F*P*~F+Q;
-  L=H*P*~H+R;
-  K=P*~H*Inverse(L);
-  M={Altitude};
-  S=S+K*(M-H*S);
-  K_Altitude = S(0,0);
-  K_VelocityZ = S(1,0);
-  P=(I-K*H)*P;
+// --- Filter ---
+// FILTERS NOISY DATA WITH BAROMETER AND ACCELEROMETER
+void FILTER2D(float AccZIntertial){
+
 }
 
-// ======================= GYRO SIGNALING =======================
-//Register map: https://invensense.tdk.com/wp-content/uploads/2015/02/MPU-6000-Register-Map1.pdf & https://www.youtube.com/watch?v=7VW_XVbtu9k 
-void gyro_signals(void) {
-  // SPECIFYING MPU SENSOR OUTPUT
-  Wire.beginTransmission(MPU6050_Address);
-  Wire.write(0x1A);  // Low-pass filter activation
-  Wire.write(0x05);  // Cut-off frequency of 10 hz -> DLPF setting of 5 = 00000101
-  Wire.endTransmission();
-  Wire.beginTransmission(MPU6050_Address);
-  Wire.write(0x1C); // Setting the sensitivity scale factor
-  Wire.write(0x10); // Setting the sensitivity scale factor to 10
-  Wire.endTransmission();
-  Wire.beginTransmission(MPU6050_Address);
-  Wire.write(0x3B); // access registers which store accel measurements
-  Wire.endTransmission(); 
-  Wire.requestFrom(MPU6050_Address,6);
-    int16_t AccXLSB = Wire.read() << 8 | Wire.read();
-    int16_t AccYLSB = Wire.read() << 8 | Wire.read();
-    int16_t AccZLSB = Wire.read() << 8 | Wire.read();
+// --- IMU SIGNALS ---
+// UPDATES THE CURRENT ATTITUDE OF THE DRONE
+void imu_signals(bool filter) {
+  sensors_event_t Acc, Rate, temp; // can grab temp if wanted
+  mpu.getEvent(&Acc, &Rate, &temp);
 
-  // ACCESSING GYRO DATA
-  Wire.beginTransmission(MPU6050_Address);
-  Wire.write(0x1B); // access registers which store accelerometer measurements
-  Wire.write(0x8);
-  Wire.endTransmission();
-  //converts the LSB reading to g's (with rough calibration added)
-  AccY = (float)AccYLSB/4096 + 0.00; // [value +/- calibration] 
-  AccX = (float)AccXLSB/4096 - 0.03;  
-  AccZ = (float)AccZLSB/4096 + 0.16;
+  // grab temp, acc, and roll values with calibration attached 
+  tempimu_f = temp.temperature*1.8+32 - 6;
+  accX = (float)Acc.acceleration.x - .95; 
+  accY = (float)Acc.acceleration.y + .55;
+  accZ = -(float)Acc.acceleration.z - 1.05;
+  rateroll = (float)Rate.gyro.x-RateCalibrationRoll;
+  ratepitch = (float)Rate.gyro.y-RateCalibrationPitch; 
+  rateyaw = (float)Rate.gyro.z-RateCalibrationYaw;
 
-  Wire.beginTransmission(MPU6050_Address); // access registers which store gyro measurements
-  Wire.write(0x43);
-  Wire.endTransmission();
-  Wire.requestFrom(MPU6050_Address,6); 
-    int16_t GyroX = Wire.read() << 8 | Wire.read(); //converts the LSB reading to g's (with calibration)
-    int16_t GyroY = Wire.read() << 8 | Wire.read();
-    int16_t GyroZ = Wire.read() << 8 | Wire.read();
-  RateRoll = (float)GyroX/65.5; // calculates the attitude of the drone
-  RatePitch = (float)GyroY/65.5;
-  RateYaw = (float)GyroZ/65.5;
+  angleroll = atan(accY/sqrt(pow(accX,2)+pow(accZ,2)))/(PI/180); // X-axis (Phi) --  
+  anglepitch = -atan(accX/sqrt(pow(accY,2)+pow(accZ,2)))/(PI/180); // Y-axis (Theta) --
 
-  AngleRoll = atan(AccY/sqrt(pow(AccX,2)+pow(AccZ,2)))/(PI/180); // X-axis (Phi) --  Result in degrees
-  AnglePitch = -atan(AccX/sqrt(pow(AccY,2)+pow(AccZ,2)))/(PI/180); // Y-axis (Theta) -- 
+  float Inertial_AccZ;
+  if(filter==true) // checks if complimentary filter is neccessary
+  {
+    FILTER(angleroll, anglepitch, altitude);
+    Inertial_AccZ = cos(k_roll*DEG_TO_RAD)*sin(k_pitch*DEG_TO_RAD)*accX - sin(k_roll*DEG_TO_RAD)*accY + cos(k_pitch*DEG_TO_RAD)*cos(k_roll*DEG_TO_RAD)*accZ; // see the vectrix math
+  }
+  else{
+    Inertial_AccZ = cos(angleroll*DEG_TO_RAD)*sin(anglepitch*DEG_TO_RAD)*accX - sin(angleroll*DEG_TO_RAD)*accY + cos(anglepitch*DEG_TO_RAD)*cos(angleroll*DEG_TO_RAD)*accZ; // see the vectrix math
 
-  // Calculates the Z component of the accelerometer
-  Inertial_AccZ = -sin(AnglePitch*RAD_TO_DEG)*AccX + cos(AnglePitch*RAD_TO_DEG)*sin(AngleRoll*RAD_TO_DEG)*AccY 
-                  + cos(AnglePitch*RAD_TO_DEG)*cos(AngleRoll*RAD_TO_DEG)*AccZ;
-  Inertial_AccZ = (Inertial_AccZ-1)*9.81*100; // conversion to m/s
-  VelocityZ = VelocityZ + Inertial_AccZ*.004;
- }
+    // attempt to mitigate the steady state error and calibrate for accurate changes
+  float dvdt_z = (Inertial_AccZ+9.81)*(1/update_hz); // in m/s
+  if (abs(dvdt_z) > .0005) velocity_z = velocity_z + (prev_dvdt - dvdt_z);   
+  prev_dvdt = dvdt_z;
+  }   
 
-// Determines current readings 
-void barometer_signals(void){
- Wire.beginTransmission(0x76);
-  Wire.write(0xF7);
-  Wire.endTransmission();
-  Wire.requestFrom(0x76,6);
-
-  uint32_t press_msb = Wire.read();
-  uint32_t press_lsb = Wire.read();
-  uint32_t press_xlsb = Wire.read();
-  uint32_t temp_msb = Wire.read();
-  uint32_t temp_lsb = Wire.read();
-  uint32_t temp_xlsb = Wire.read();
-
-  unsigned long int adc_P = (press_msb << 12) | (press_lsb << 4) | (press_xlsb >>4);
-  unsigned long int adc_T = (temp_msb << 12) | (temp_lsb << 4) | (temp_xlsb >>4);
-
-  signed long int var1, var2;
-  var1 = ((((adc_T >> 3) - ((signed long int )dig_T1 <<1)))* ((signed long int )dig_T2)) >> 11;
-  var2 = (((((adc_T >> 4) - ((signed long int )dig_T1)) * ((adc_T>>4) - ((signed long int )dig_T1)))>> 12) * ((signed long int )dig_T3)) >> 14;
-  signed long int t_fine = var1 + var2;
-  unsigned long int p;
-  var1 = (((signed long int )t_fine)>>1) - (signed long int )64000;
-  var2 = (((var1>>2) * (var1>>2)) >> 11) * ((signed long int )dig_P6);
-  var2 = var2 + ((var1*((signed long int )dig_P5)) <<1);
-  var2 = (var2>>2)+(((signed long int )dig_P4)<<16);
-  var1 = (((dig_P3 * (((var1>>2)*(var1>>2)) >> 13 ))>>3)+((((signed long int )dig_P2) * var1)>>1))>>18;
-  var1 = ((((32768+var1))*((signed long int )dig_P1)) >>15);
-  if (var1 == 0) { p=0;}    
-  p = (((unsigned long int )(((signed long int ) 1048576)-adc_P)-(var2>>12)))*3125;
-  if(p<0x80000000){ p = (p << 1) / ((unsigned long int ) var1);}
-  else { p = (p / (unsigned long int )var1) * 2;  }
-  var1 = (((signed long int )dig_P9) * ((signed long int ) (((p>>3) * (p>>3))>>13)))>>12;
-  var2 = (((signed long int )(p>>2)) * ((signed long int )dig_P8))>>13;
-  p = (unsigned long int)((signed long int )p + ((var1 + var2+ dig_P7) >> 4));
-
-  double pressure=(double)p/100; 
-
-  Pressure = pressure/10; //converts into kilo-pascal
-  Altitude = 44330*(1-pow(pressure/1013.25, 1/5.255)) * 100; // currently in centimeters
+  // attempt to mitigate the steady state error and calibrate for accurate changes
+  float d_yaw = rateyaw*(dt/1E6)*RAD_TO_DEG; 
+  if (abs(d_yaw) > .00175){ 
+    angleyaw = angleyaw + d_yaw*2.65; // Z-axis (Beta) -- there is steady state error only viable for short term changes;
+    if (abs(angleyaw) > 360) angleyaw = angleyaw-angleyaw;};
 }
 
-// Verifies current battery life
-float bms_check(bool init){
-  float voltage, batteryremaining, batteryatstart;
- // float current, currcons, precurrcons;
-  float batterydefault = 1200;
-  float R1 = 1850;
-  float R2 = 535;
-  float RVdrop = 464;
-  float vdropratio = (RVdrop/100)/14;
+// --- GET ENVIRONMENT ---
+// Gathers the current altitude readings from the TOF and Barometric sensors.
+void get_env(bool startup){
+  tempbaro_f = bmp.readTemperature()*1.8+32 - 5;
+  pressure_baro = bmp.readPressure(); 
 
-  voltage = (float)analogRead(A1)/1023*5*((R1+R2)/R2);  //VOLTAGE DIVIDER READING
- // current = (float)analogRead(A6)/(1023/5)*vdropratio;
+  if (startup==true) altitude = bmp.readAltitude(1013.25)*100; // measurement in cm
+  else altitude = bmp.readAltitude(1013.25)*100 - alt_Cal;
+  
+  alt_tof = (float)tofsensor.readRangeContinuousMillimeters()*mm2in; 
+}
+
+// --- BMS CHECK ---
+// MONITORS THE BATTERY IN THE DRONE
+float bms(void)
+{
+  static float batterydefault = 1200, batteryatstart;
+  float voltage;
+  float R1 = 1994;
+  float R2 = 547;
+
+  voltage = (float)analogRead(V_DIV)/1023*5*((R1+R2)/R2);  //VOLTAGE DIVIDER READING
 
   if (voltage>8.3){
     batteryatstart=batterydefault;
     digitalWrite(RED_LED, LOW);
-    digitalWrite(GREEN_LED, HIGH); //keep green led on
+    digitalWrite(GREEN_LED, HIGH); //turn green led on
   }else if(voltage<7.5){
     batteryatstart=30/100*batterydefault;
     digitalWrite(RED_LED, HIGH);
-    digitalWrite(GREEN_LED, LOW); // keep green led on
+    digitalWrite(GREEN_LED, LOW); // turn red led on
   }else{
     batteryatstart=(82*voltage-580)/100*batterydefault;
     digitalWrite(RED_LED, LOW);
-    digitalWrite(GREEN_LED, HIGH); // turn on green led
+    digitalWrite(GREEN_LED, HIGH); // turn green led on
   }
     return voltage;
-  }
+}
 
-
-void setup(void) {
- /*Makes contact with the serial interface*/
-  Serial.begin(115200);
-  pinMode(13, OUTPUT);
-  digitalWrite(13, HIGH);
-  Wire.setClock(400000);
-  Wire.begin();
-  delay(250);
-  Wire.beginTransmission(0x68); 
-  Wire.write(0x6B);
-  Wire.write(0x00);   
-  Wire.endTransmission();
-  Wire.beginTransmission(0x76); 
-  Wire.write(0xF4);
-  Wire.write(0x57);
-  Wire.endTransmission();   
-  Wire.beginTransmission(0x76);
-  Wire.write(0xF5); 
-  Wire.write(0x14);
-  Wire.endTransmission();  
-
-  // Barometric reading
-  uint8_t data[24], i=0;
-  Wire.beginTransmission(0x76);
-  Wire.write(0x88);
-  Wire.endTransmission();
-  Wire.requestFrom(0x76,24);
-  while(Wire.available()){
-    data[i] = Wire.read();
-    i++;
-  }
-  dig_T1 = (data[1] << 8) | data[0];
-  dig_T2 = (data[3] << 8) | data[2];
-  dig_T3 = (data[5] << 8) | data[4];
-  dig_P1 = (data[7] << 8) | data[6];
-  dig_P2 = (data[9] << 8) | data[8];
-  dig_P3 = (data[11] << 8) | data[10];
-  dig_P4 = (data[13] << 8) | data[12];
-  dig_P5 = (data[15] << 8) | data[14];
-  dig_P6 = (data[17] << 8) | data[16];
-  dig_P7 = (data[19] << 8) | data[18];
-  dig_P8 = (data[21] << 8) | data[20];
-  dig_P9 = (data[23] << 8) | data[22];
-  delay(250);
-
-  /*Battery LED Set-up*/
-  pinMode(RED_LED, OUTPUT); // Red LED pinout
-  pinMode(GREEN_LED, OUTPUT); // Green LED pinout
-  batterylife=bms_check(true);
- // checks current battery life
-
-  /*IMU Calibration timer*/
-  if(true) // Skips calibration if false
-  {
-    for (RateCalibrationNumber=0; RateCalibrationNumber<2000; RateCalibrationNumber++)
-    {
-      barometer_signals();
-      AltitudeStartUp += Altitude;
-      gyro_signals();
-      RateCalibrationRoll += RateRoll;
-      RateCalibrationPitch += RatePitch;
-      RateCalibrationYaw += RateYaw;
-      delay(1);
+// --- CALIBRATE ---
+// CALIBRATES THE DRONE AT START-UP (specify calibration length in ms)
+void calibrate(int cal_time){
+  for (int RateCalibrationNumber=0; RateCalibrationNumber<cal_time; RateCalibrationNumber++){
+      get_env(true);
+      alt_Cal += altitude;
+      imu_signals(false);
+      RateCalibrationRoll += rateroll;
+      RateCalibrationPitch += ratepitch;
+      RateCalibrationYaw += rateyaw;
+      delay(1); 
     }
-    AltitudeStartUp /= 2000;
-    RateCalibrationRoll /= 2000;
-    RateCalibrationPitch /= 2000;
-    RateCalibrationYaw /= 2000;
+
+    alt_Cal /= cal_time;
+    RateCalibrationRoll /= cal_time;
+    RateCalibrationPitch /= cal_time;
+    RateCalibrationYaw /= cal_time;
+}
+
+// ===========================================================================================================================================================
+// ======================================================================= SET-UP ============================================================================
+// ===========================================================================================================================================================
+
+void setup(){
+  Serial.begin(230400);                         // initialize serial monitor
+  Wire.begin();                                 // initialize i2c communication
+
+  while (!Serial) delay(10);                    // checks to make sure that serial communication is achieved
+  Serial.println("===== Drone Initalization =====");
+
+// --- Barometer (BMP280) ---   
+  if(!bmp.begin(0x76)){
+    Serial.println("Failed to find BMP280 chip");
+    while (1) delay(10);
+  }
+  Serial.println("BMP280 Found");
+
+// --- TIME OF FLIGHT SENSOR ---
+  if (!tofsensor.init(0x52)){
+    Serial.println("Failed to detect VL53L0X");
+    while(1) delay(10);
+  }
+  Serial.println("VL53L0X Found");    
+  tofsensor.startContinuous();       
+
+// --- MPU 6050 (IMU) ---                               
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1) delay(10);
   }
 
-  //Defining Kalman Matrix Values
-    F = {1, 0.004, 0, 1};
-    G = {0.5*0.004*0.004, 0.004};
-    H = {1, 0};
-    I = {1, 0, 0, 1};
-    Q = G*~G*10.0f*10.0f;
-    R = {30*30};
-    P = {0, 0, 0, 0};
-    S = {0, 0};
-    LoopTimer = micros();
-} 
+  Serial.println("MPU6050 Found");
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G); // setting g range -> OPTIONS: MPU6050_RANGE_2_G, MPU6050_RANGE_4_G, MPU6050_RANGE_8_G, MPU6050_RANGE_16_G
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);      // setting the angular range of gyro -> OPTIONS: MPU6050_RANGE_250_DEG, MPU6050_RANGE_500_DEG, MPU6050_RANGE_1000_DEG, MPU6050_RANGE_2000_DEG
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);   // setting the bandwith filter of data -> OPTIONS: MPU6050_BAND_260_HZ, MPU6050_BAND_184_HZ, MPU6050_BAND_94_HZ, MPU6050_BAND_44_HZ, MPU6050_BAND_21_HZ, MPU6050_BAND_10_HZ, MPU6050_BAND_5_HZ;
+  calibrate(500);                            // calibration for x seconds     
 
-void loop() 
-{
-  //gyro
-  gyro_signals();
-  RateRoll -= RateCalibrationRoll;
-  RatePitch -= RateCalibrationPitch;
-  RateYaw -= RateCalibrationYaw;
+// --- BATTERY MONITORING ---
+  pinMode(RED_LED, OUTPUT);                     // sets the LED's and gathers first datapoint for battery monitoring
+  pinMode(GREEN_LED, OUTPUT);
+  volt_battery = bms();
+}
 
-  //battery
-  batterylife=bms_check(false);
+// ===========================================================================================================================================================
+// =========================================================================== MAIN ==========================================================================
+// ===========================================================================================================================================================
 
-  //barometer
-  barometer_signals();
-  Altitude -= AltitudeStartUp;
+void loop(){
+  // --- Sensor updates ---
+  get_env(false);                   // determines the environment
+  imu_signals(true);                // determines the attitude
+  volt_battery = bms();             // monitors the battery
 
-  //ultrasonic
-  int distance = sonar.ping_cm(); // sonar reading in cm
+  //Reading the remote inputs
+  for (byte channel = 1; channel <= channelAmount; ++channel) {
+    if(channel == 1) arrayindex = 0;
+    Controller_CH[arrayindex] = ppm.latestValidChannelValue(channel, 0)-1000;
+    ++arrayindex;
+  }
+  
+  // Controller
+  //Serial.print(">CH1:");
+  //Serial.println(Controller_CH[0]);
+  //Serial.print(">CH2:");
+  //Serial.println(Controller_CH[1]);
+  //Serial.print(">CH3:");
+  //Serial.println(Controller_CH[2]);
+  //Serial.print(">CH4:");
+  //Serial.println(Controller_CH[3]);
+  //Serial.print(">CH5:");
+  //Serial.println(Controller_CH[4]);
+  //Serial.print(">CH6:");
+  //Serial.println(Controller_CH[5]);
 
-  // Applied Kalman Filters
-  k1d(K_AngleRoll, K_UncertaintyAngleRoll, RateRoll, AngleRoll);
-  K_AngleRoll = K_1DOutput[0], K_UncertaintyAngleRoll = K_1DOutput[1];
-  k1d(K_AnglePitch, K_UncertaintyAnglePitch, RatePitch, AnglePitch);
-  K_AnglePitch = K_1DOutput[0], K_UncertaintyAnglePitch = K_1DOutput[1];
-  k2d();
+  // IMU
+  //Serial.print(">Roll:");
+  //Serial.println(k_roll);
+  //Serial.print(">Pitch:");
+  //Serial.println(k_pitch);
+  //Serial.print(">Yaw:");
+  //Serial.println(angleyaw);
 
-  Serial.print(">AngleRoll:");
-  Serial.println(K_AngleRoll);
-  Serial.print(">Altitude:");
-  Serial.println(K_Altitude);
-  Serial.print(">Batterylife:");
-  Serial.println(batterylife);
-  Serial.print(">K_VelocityZ:");
-  Serial.println(K_VelocityZ);
-  Serial.print(">Distance:");
-  Serial.println(distance);
+  // Barometer and height
+  Serial.print(">Z_Height:");
+  Serial.println(alt_tof);
+  //Serial.print(">Z_vel:");
+  //Serial.println(velocity_z);
+  //Serial.print(">Altitude (1d filter):");
+  //Serial.println(k_alt);
+  //Serial.print(">Altitude (2d filter):");
+  //Serial.println(altitude);
 
-  while (micros() - LoopTimer < 4000);
-  LoopTimer = micros();
+  //Environmental readings
+  //Serial.print(">Temp (imu):");
+  //Serial.println(tempimu_f);
+  //Serial.print(">Temp (baro):");
+  //Serial.println(tempbaro_f);
+  //Serial.print(">Pressure (baro):");
+  //Serial.println(pressure_baro);
+  //Serial.print(">Battery Voltage:");
+  //Serial.println(volt_battery);
+
+  delayMicroseconds(dt);
 }
